@@ -1,12 +1,11 @@
 from pydantic import BaseModel
 from typing import Any
-from typing import Literal
 
 class RegisterRequest(BaseModel):
     username: str
     password: str
     display_name: str
-    role: Literal["owner", "trustee", "beneficiary", "legal_advisor"]
+    role: str
     public_key: str
 
 

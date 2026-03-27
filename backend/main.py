@@ -374,7 +374,23 @@ def create_asset_api(req: CreateAssetRequest):
         "encrypted_size": encrypted_size
     }
 
+@app.get("/debug/vault/{plan_id}")
+def debug_vault(plan_id: str):
+    mk = get_temp_mk(plan_id)
+    if not mk:
+        raise HTTPException(status_code=404, detail="MK 없음")
 
+    kv = get_key_vault_by_plan(plan_id)
+    if not kv:
+        raise HTTPException(status_code=404, detail="vault 없음")
+
+    vault_dict = decrypt_vault(
+        encrypted_blob=kv["encrypted_vault_blob"],
+        nonce=kv["vault_nonce"],
+        mk=mk
+    )
+
+    return vault_dict
 
 
 @app.post("/plans/{plan_id}/finalize")
@@ -1239,6 +1255,56 @@ def get_plan_recovery_sessions_api(plan_id: str):
     }
 
 
+@app.get("/debug/shares/{plan_id}")
+def debug_shares_api(plan_id: str):
+    shares = get_assigned_shares_by_plan(plan_id)
+
+    return {
+        "plan_id": plan_id,
+        "shares": [
+            {
+                "share_id": row["share_id"],
+                "recipient_id": row["recipient_id"],
+                "recipient_role": row["recipient_role"],
+                "share_index": row["share_index"],
+                "encrypted_share_blob": row["encrypted_share_blob"]
+            }
+            for row in shares
+        ]
+    }
+
+
+@app.get("/debug/recovery-packages/{recovery_id}")
+def debug_recovery_packages_api(recovery_id: str):
+    packages = get_recovery_packages_by_recovery(recovery_id)
+
+    return {
+        "recovery_id": recovery_id,
+        "packages": [
+            {
+                "package_id": p["package_id"],
+                "recipient_id": p["recipient_id"],
+                "recipient_role": p["recipient_role"],
+                "encrypted_package_blob": p["encrypted_package_blob"]
+            }
+            for p in packages
+        ]
+    }
+
+
+
+@app.get("/debug/ok-material/{plan_id}")
+def debug_ok_material_api(plan_id: str):
+    ok_material = get_operational_key_material(plan_id)
+    if not ok_material:
+        raise HTTPException(status_code=404, detail="OK material 없음")
+
+    return {
+        "plan_id": plan_id,
+        "has_ok_key_blob": ok_material["ok_key_blob"] is not None,
+        "wrapped_mk_ok_blob_len": len(ok_material["wrapped_mk_ok_blob"]) if ok_material["wrapped_mk_ok_blob"] else 0,
+        "wrapped_mk_ok_nonce_len": len(ok_material["wrapped_mk_ok_nonce"]) if ok_material["wrapped_mk_ok_nonce"] else 0
+    }
 
 
 @app.post("/plans/{plan_id}/deadman-policy")
@@ -1607,3 +1673,78 @@ def mark_notification_read_api(notification_id: str, req: NotificationReadReques
         "user_id": req.user_id
     }
 
+# ---------------------------
+# 테스트용 강제 상태 전이
+# ---------------------------
+@app.post("/debug/force-state/{plan_id}")
+def force_state_api(plan_id: str, state: str):
+    """
+    테스트 전용 — 상태를 즉시 원하는 값으로 강제 전이
+    state: active / pending_confirmation / escalated / inheritance_activated
+    """
+    plan = get_plan_by_id(plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="plan 없음")
+
+    allowed = ["active", "pending_confirmation", "escalated", "inheritance_activated"]
+    if state not in allowed:
+        raise HTTPException(status_code=400, detail=f"허용된 상태: {allowed}")
+
+    now_time = now()
+    update_system_state(
+        plan_id=plan_id,
+        current_state=state,
+        pending_started_at=now_time if state == "pending_confirmation" else None,
+        escalated_at=now_time if state == "escalated" else None,
+        inheritance_activated_at=now_time if state == "inheritance_activated" else None,
+    )
+
+    create_audit_log(
+        plan_id=plan_id,
+        actor_id="debug",
+        action_type="force_state_transition",
+        target_type="system_state",
+        target_id=plan_id,
+        details_json=json.dumps({"forced_state": state})
+    )
+
+    # pending 전이 시 owner 알림 발송
+    if state == "pending_confirmation":
+        plan_data = get_plan_by_id(plan_id)
+        if plan_data:
+            create_notification(
+                user_id=plan_data["owner_id"],
+                plan_id=plan_id,
+                notification_type="deadman_pending_confirmation",
+                message="장기간 check-in이 없어 pending_confirmation 상태로 전이되었습니다. 확인이 필요합니다."
+            )
+
+    # escalated 전이 시 trustee 알림 발송
+    if state == "escalated":
+        participants = get_participants_by_plan(plan_id)
+        for p in participants:
+            if p["participant_role"] == "trustee":
+                create_notification(
+                    user_id=p["user_id"],
+                    plan_id=plan_id,
+                    notification_type="inheritance_approval_request",
+                    message="상속 승인 요청이 있습니다. 검토 후 승인해주세요."
+                )
+
+    # inheritance_activated 전이 시 beneficiary 알림 발송
+    if state == "inheritance_activated":
+        participants = get_participants_by_plan(plan_id)
+        for p in participants:
+            if p["participant_role"] == "beneficiary":
+                create_notification(
+                    user_id=p["user_id"],
+                    plan_id=plan_id,
+                    notification_type="inheritance_activated",
+                    message="상속이 활성화되었습니다. Share를 제출하여 자산을 복구할 수 있습니다."
+                )
+
+    return {
+        "message": f"상태 강제 전이 완료",
+        "plan_id": plan_id,
+        "current_state": state
+    }
